@@ -524,7 +524,7 @@ impl Drop for TouchWriter {
         let mut t = self.keys.touches.lock().unwrap_or_else(|p| p.into_inner());
         t.writing = false;
         // Unwritten, so not throttled: each is queued again on its next use.
-        let mut abandoned: HashSet<i64> = t.pending.drain().collect();
+        let mut abandoned = std::mem::take(&mut t.pending);
         abandoned.extend(self.batch.drain(..));
         for id in &abandoned {
             t.last.remove(id);
