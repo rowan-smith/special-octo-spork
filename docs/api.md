@@ -162,7 +162,9 @@ failed; their keys are tried again after a minute). `queued` uses were
 due a write and `written` rows were updated. Not written: `dropped` (all
 `pendingCapacity` slots waiting), `deferred` (every tracked key written
 within the last minute), `retired` (the key was revoked after the request
-was admitted) and `abandoned` (the writer stopped without writing them).
+was admitted) and `abandoned` (the writer stopped, by a panic or at
+shutdown, without writing them, whether waiting or in its batch; they are
+queued again on their next use).
 `forgotten` entries were dropped because their key was revoked.
 
 ## Native event ingestion

@@ -311,7 +311,7 @@ impl ApiKeys {
         t.writing = true;
         drop(t);
         if start {
-            let writer = TouchWriter { keys: self.clone(), finished: false };
+            let writer = TouchWriter::new(self.clone());
             tokio::task::spawn_blocking(move || writer.run());
         }
         Touch::Queued
@@ -403,8 +403,10 @@ pub enum Touch {
 /// * At most [`MAX_PENDING_KEY_TOUCHES`] keys wait, each once however
 ///   often it is used, and one blocking thread writes them, as many as are
 ///   waiting in one transaction. Nothing else is spawned or waited on.
-/// * A failed or panicking write, or a writer that never runs (shutdown),
-///   gives everything back. Waiting keys are not written at exit.
+/// * A failed write keeps its keys throttled (retried after the interval).
+///   A panicking writer, or one that never runs (shutdown), gives back its
+///   slot, the waiting keys and the batch it was writing, unthrottled.
+///   Waiting keys are not written at exit.
 #[derive(Default)]
 struct Touches {
     /// When each key was last queued for writing.
@@ -450,7 +452,8 @@ struct TouchStats {
     written: AtomicU64,
     batches: AtomicU64,
     failed_batches: AtomicU64,
-    /// Waiting keys given up because the writer panicked or never ran.
+    /// Keys, waiting or in the batch being written, given up because the
+    /// writer panicked or never ran.
     abandoned: AtomicU64,
     dropped: AtomicU64,
     deferred: AtomicU64,
@@ -461,25 +464,35 @@ struct TouchStats {
 
 /// The one writer: writes waiting keys until none are left. However it
 /// ends (a panic, or never running because the runtime shut down), the
-/// writer slot and the keys it did not write are given back.
+/// writer slot and the keys it did not write, waiting or in the batch it
+/// was writing, are given back.
 struct TouchWriter {
     keys: Arc<ApiKeys>,
+    /// The batch being written: taken from `pending`, not yet answered by
+    /// the write.
+    batch: Vec<i64>,
     finished: bool,
 }
 
 impl TouchWriter {
+    fn new(keys: Arc<ApiKeys>) -> Self {
+        Self { keys, batch: Vec::new(), finished: false }
+    }
+
     fn run(mut self) {
         loop {
-            let batch: Vec<i64> = {
+            {
                 let mut t = self.keys.touches.lock().unwrap();
                 if t.pending.is_empty() {
                     t.writing = false;
                     self.finished = true;
                     return;
                 }
-                t.pending.drain().collect()
-            };
-            let r = (self.keys.write_touches)(&batch);
+                self.batch = t.pending.drain().collect();
+            }
+            let r = (self.keys.write_touches)(&self.batch);
+            // Answered (even by an error): no longer the writer's to give back.
+            let batch = std::mem::take(&mut self.batch);
             let s = &self.keys.touch_stats;
             s.batches.fetch_add(1, Ordering::Relaxed);
             let mut t = self.keys.touches.lock().unwrap();
@@ -510,7 +523,9 @@ impl Drop for TouchWriter {
         }
         let mut t = self.keys.touches.lock().unwrap_or_else(|p| p.into_inner());
         t.writing = false;
-        let abandoned: Vec<i64> = t.pending.drain().collect();
+        // Unwritten, so not throttled: each is queued again on its next use.
+        let mut abandoned: HashSet<i64> = t.pending.drain().collect();
+        abandoned.extend(self.batch.drain(..));
         for id in &abandoned {
             t.last.remove(id);
         }
@@ -1896,9 +1911,48 @@ mod tests {
         assert_eq!(keys.touch_at(2, &set, now), Touch::Queued);
         release.send(()).unwrap();
         idle(&keys).await;
-        assert_eq!((tstat(&keys, "abandoned"), tstat(&keys, "writers"), tstat(&keys, "pending")), (1, 0, 0));
-        assert_eq!(keys.touch_at(2, &set, now), Touch::Queued, "an abandoned key is queued again on its next use");
+        // Key 1 was in the batch being written, key 2 waiting: both given back.
+        assert_eq!((tstat(&keys, "abandoned"), tstat(&keys, "writers"), tstat(&keys, "pending")), (2, 0, 0));
+        assert_eq!(tstat(&keys, "tracked"), 0);
+        for id in [1, 2] {
+            assert_eq!(
+                keys.touch_at(id, &set, now),
+                Touch::Queued,
+                "abandoned key {id} is queued again on its next use"
+            );
+        }
         idle(&keys).await;
+        assert_bounded(&keys);
+    }
+
+    // AC3 (review): a writer that panics after taking a batch gives that
+    // batch back, so its keys are not throttled for a minute without having
+    // been written; the next use within the interval queues and writes them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_writer_gives_back_the_batch_it_was_writing() {
+        let (record, written) = recording();
+        let panicked = Arc::new(AtomicBool::new(false));
+        let p = panicked.clone();
+        let write: TouchWrite = Arc::new(move |ids: &[i64]| {
+            if !p.swap(true, Ordering::SeqCst) {
+                panic!("injected last-used write panic after taking the batch");
+            }
+            record(ids)
+        });
+        let keys = active(1, write);
+        let set = keys.snapshot();
+        let now = Instant::now();
+        assert_eq!(keys.touch_at(1, &set, now), Touch::Queued);
+        idle(&keys).await;
+        assert!(panicked.load(Ordering::SeqCst));
+        assert_eq!((tstat(&keys, "abandoned"), tstat(&keys, "tracked"), tstat(&keys, "written")), (1, 0, 0));
+        assert!(written.lock().unwrap().is_empty());
+
+        // Within the interval: not throttled, since nothing was written.
+        assert_eq!(keys.touch_at(1, &set, now + Duration::from_secs(1)), Touch::Queued);
+        idle(&keys).await;
+        assert_eq!(*written.lock().unwrap(), [1]);
+        assert_eq!(keys.touch_at(1, &set, now + Duration::from_secs(2)), Touch::Throttled, "written: throttled again");
         assert_bounded(&keys);
     }
 

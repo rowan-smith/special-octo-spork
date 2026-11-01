@@ -236,7 +236,9 @@ bookkeeping instead:
 * **Failures.** A failed write is counted and logged once per run of
   failures (no key ids); its keys are tried again after the interval, not
   at once. If the writer panics, or never runs because the runtime is
-  shutting down, the writer slot and the waiting keys are given back.
+  shutting down, the writer slot, the waiting keys and the batch it was
+  writing are given back, unthrottled, so each is queued again on its next
+  use.
   Waiting keys are not written at exit, and a restart starts with no
   bookkeeping, so the first use of each key after it is written again.
 
