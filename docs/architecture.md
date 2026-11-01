@@ -194,9 +194,58 @@ A create or revoke (`ApiKeys::change`):
    never diverge and a late write cannot overtake a later change.
 
 The change is linearised at the swap, which follows the SQLite commit and
-precedes the response. Lock order is change mutex → set pointer; the set
-pointer is never held across anything else, and the per-key last-used
-throttle (`key_touch`) is a separate lock never held with either.
+precedes the response. Lock order is change mutex → set pointer and
+last-used bookkeeping → set pointer; the set pointer is never held across
+anything else.
+
+### API key last-used tracking
+
+`api_keys.last_used_at` is approximate and informational: nothing is
+decided by it. Before AUTH-PERF-03 the server remembered every key id it
+had ever written a last-used time for, never forgetting revoked ones, and
+spawned one blocking task per due write. `ApiKeys::touch` (one call per
+request authenticated by key, after admission) now keeps bounded
+bookkeeping instead:
+
+* **Throttle.** A key is written at most once per `KEY_TOUCH_INTERVAL`
+  (60 s), counted from when its write was queued, whether or not it then
+  succeeds, as before.
+* **Entries.** At most `KEY_TOUCH_ENTRIES` (4096) keys are remembered, each
+  counted as `KEY_TOUCH_ENTRY_BYTES` (48 bytes: 192 KiB in all), and only
+  active ones. An entry older than the interval would be written anyway,
+  so only those are evicted, and only when the map is full; a lower bound
+  on the oldest entry means a full map is scanned only when something can
+  be freed. While all 4096 are younger, a further key is not written
+  (`deferred`) until one ages out, so eviction can never turn requests
+  into writes.
+* **Work.** At most `MAX_PENDING_KEY_TOUCHES` (1024) keys wait, each once
+  however often it is used; beyond that a key is not written (`dropped`)
+  and is tried again on its next request. One blocking thread at most
+  writes them, all waiting keys in one SQLite transaction
+  (`Metadata::touch_api_keys`, which skips revoked rows), until none are
+  left. Nothing else is spawned or waited on, and a request never waits
+  for this: it decides only whether to queue.
+* **Revocation.** A key change, in the step that publishes the new set
+  (after the SQLite commit, before the response, run to the end even if
+  the client goes away), drops the entries and waiting writes of keys no
+  longer in it. A touch checks, under the bookkeeping lock, that its key is
+  still in the current set, and the change takes that lock only after
+  publishing, so a request admitted just before a revoke either sees the
+  key gone (`retired`) or has its entry removed by the revoke: revoked
+  keys never come back.
+* **Failures.** A failed write is counted and logged once per run of
+  failures (no key ids); its keys are tried again after the interval, not
+  at once. If the writer panics, or never runs because the runtime is
+  shutting down, the writer slot, the waiting keys and the batch it was
+  writing are given back, unthrottled, so each is queued again on its next
+  use.
+  Waiting keys are not written at exit, and a restart starts with no
+  bookkeeping, so the first use of each key after it is written again.
+
+Retained state is therefore at most min(active keys, 4096) entries plus at
+most 1024 waiting ids and one blocking thread, however many keys have
+ever been created or revoked. `/api/v1/system/info` reports it as
+`apiKeyTouch` ([API](api.md#api-keys)).
 
 ### Session authentication
 

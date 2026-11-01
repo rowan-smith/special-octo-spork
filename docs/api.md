@@ -138,6 +138,35 @@ Key changes take effect when their response is sent:
   metadata database, so it can wait while a key change is being written;
   later requests of that session do not.
 
+`lastUsedAt` in the key list is approximate: it is written in the
+background, at most once a minute per key, so it can lag the latest use by
+up to a minute (or more while the metadata database is failing or very
+busy, or while over 4096 keys were each used within the last minute).
+Uses not yet written when the server stops are not recorded. No request
+waits for it and none is refused because of it; a revoked key's time is
+never updated. `/api/v1/system/info` reports the bookkeeping behind it,
+counted since the process started (`apiKeyTouch`, no key ids):
+
+```json
+"apiKeyTouch": { "tracked": 12, "trackedCapacity": 4096, "trackedBytes": 576,
+                 "trackedByteCapacity": 196608, "pending": 0, "pendingCapacity": 1024,
+                 "peakPending": 9, "writers": 0, "writerCapacity": 1,
+                 "queued": 340, "written": 331, "batches": 120, "failedBatches": 0,
+                 "abandoned": 0, "dropped": 0, "deferred": 0, "retired": 2, "forgotten": 7 }
+```
+
+`tracked` keys are remembered as written recently (at most
+`trackedCapacity`, counted at 48 bytes each); `pending` keys wait for the
+one `writers` thread, which writes them in `batches` (`failedBatches`
+failed; their keys are tried again after a minute). `queued` uses were
+due a write and `written` rows were updated. Not written: `dropped` (all
+`pendingCapacity` slots waiting), `deferred` (every tracked key written
+within the last minute), `retired` (the key was revoked after the request
+was admitted) and `abandoned` (the writer stopped, by a panic or at
+shutdown, without writing them, whether waiting or in its batch; they are
+queued again on their next use).
+`forgotten` entries were dropped because their key was revoked.
+
 ## Native event ingestion
 
 ```
@@ -629,7 +658,7 @@ change is recorded and POSTed to the webhook (3 attempts, 10 s timeout):
 ```
 GET /health                      → 200 {"status": "ok"} while the process runs
 GET /ready                       → 200 {"status": "ready", "storageWritable": true}, 503 {"status": "degraded", ...} or, while shutting down, 503 {"status": "draining"}
-GET /api/v1/system/info          version, uptime, event counts, queue depths, connection, ingest and query admission, session-auth timings, active segments, memory budgets, recovery status
+GET /api/v1/system/info          version, uptime, event counts, queue depths, connection, ingest and query admission, session-auth timings, API key last-used bookkeeping, active segments, memory budgets, recovery status
 GET /api/v1/system/storage       raw/stored bytes, compression ratio, index overhead, recovery status, per-signal detail
 GET /api/v1/system/query-stats   per-field query statistics (input for future adaptive indexing)
 GET /api/v1/system/config        effective configuration (secrets omitted)

@@ -281,6 +281,26 @@ fn api_keys_store_hashes_only() {
     assert!(matches!(m.revoke_api_key(k.id), Err(MetadataError::NotFound)));
 }
 
+// AUTH-PERF-03: last-used writes are batched, and never touch revoked keys.
+#[test]
+fn touching_api_keys_in_a_batch_skips_revoked_keys() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("metadata.db");
+    let m = Metadata::open(&path).unwrap();
+    let a = m.create_api_key("a", "vyr_a", "hash-a", "ingest").unwrap();
+    let b = m.create_api_key("b", "vyr_b", "hash-b", "admin").unwrap();
+    let gone = m.create_api_key("gone", "vyr_g", "hash-g", "ingest").unwrap();
+    m.revoke_api_key(gone.id).unwrap();
+    assert_eq!(m.touch_api_keys(&[a.id, b.id, gone.id, 999]).unwrap(), 2);
+    assert!(m.list_api_keys().unwrap().iter().all(|k| k.last_used_at.is_some()));
+    assert_eq!(m.touch_api_keys(&[]).unwrap(), 0);
+    drop(m);
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let revoked_used: Option<i64> =
+        c.query_row("SELECT last_used_at FROM api_keys WHERE id = ?1", [gone.id], |r| r.get(0)).unwrap();
+    assert_eq!(revoked_used, None, "a revoked key's row is left alone");
+}
+
 #[test]
 fn users_and_sessions() {
     let m = Metadata::open_in_memory().unwrap();

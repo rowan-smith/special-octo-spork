@@ -16,7 +16,9 @@ FIXTURES=tests/fixtures
 PASSWORD=drill-password
 TRACE=4bf92f3577b34da6a3ce929d0e0e4736
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/vyrtel-restore-drill.XXXXXX")
-PORT=$((20000 + RANDOM % 20000))
+# Below the ephemeral ranges (Linux 32768+, macOS 49152+), so no outgoing
+# connection, such as one an earlier CI step left in TIME_WAIT, holds it.
+PORT=$((20000 + RANDOM % 12000))
 URL="http://127.0.0.1:$PORT"
 PID=
 

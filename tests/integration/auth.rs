@@ -739,3 +739,70 @@ async fn logout_is_immediate_under_concurrent_cached_requests() {
     assert_eq!(session_lookups(&s, &by_key).await["failed"], 0);
     Arc::into_inner(s).unwrap().stop().await;
 }
+
+/// The server's last-used bookkeeping (AUTH-PERF-03), once its writer is idle.
+async fn key_touches(s: &TestServer) -> Value {
+    for _ in 0..500 {
+        let info: Value = s.client.get(s.u("/api/v1/system/info")).send().await.unwrap().json().await.unwrap();
+        let t = info["apiKeyTouch"].clone();
+        if t["pending"] == 0 && t["writers"] == 0 {
+            return t;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the last-used writer did not go idle");
+}
+
+/// Keys used for ingestion get their last-used time, once a minute at most;
+/// revoking them reclaims their bookkeeping; the open/protected policy and
+/// what a revoked key gets are unchanged; no key or hash is reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_key_last_used_is_recorded_and_revoked_keys_are_reclaimed() {
+    let s = TestServer::start().await;
+    let mut keys = Vec::new();
+    for i in 0..20 {
+        keys.push(create_key(&s, &format!("k{i}"), "ingest").await);
+    }
+    for (_, key) in &keys {
+        assert_eq!(ingest(&s, Some(key)).await, 200);
+    }
+    let t = key_touches(&s).await;
+    // The harness's admin key is tracked too (it made these requests).
+    assert_eq!(t["tracked"], 21);
+    assert_eq!((t["trackedCapacity"].as_u64(), t["pendingCapacity"].as_u64()), (Some(4096), Some(1024)));
+    assert_eq!(
+        (t["failedBatches"].as_u64(), t["dropped"].as_u64(), t["deferred"].as_u64()),
+        (Some(0), Some(0), Some(0))
+    );
+    let listed: Value = s.client.get(s.u("/api/v1/api-keys")).send().await.unwrap().json().await.unwrap();
+    let listed = listed["apiKeys"].as_array().unwrap();
+    assert!(listed.iter().all(|k| k["lastUsedAt"].is_i64()), "every key used has a last-used time");
+
+    // Used again within the minute: admitted, not written again.
+    let queued = t["queued"].as_u64().unwrap();
+    for (_, key) in &keys {
+        assert_eq!(ingest(&s, Some(key)).await, 200);
+    }
+    assert_eq!(key_touches(&s).await["queued"].as_u64(), Some(queued));
+
+    for (id, _) in &keys {
+        revoke_key(&s, *id).await;
+    }
+    let t = key_touches(&s).await;
+    assert_eq!((t["tracked"].as_u64(), t["forgotten"].as_u64()), (Some(1), Some(20)));
+    for (_, key) in &keys {
+        assert_eq!(ingest(&s, Some(key)).await, 200, "no ingest key left: open, as before");
+    }
+    let (_, last) = create_key(&s, "last", "ingest").await;
+    for (_, key) in &keys {
+        assert_eq!(ingest(&s, Some(key)).await, 401, "a revoked key is refused");
+    }
+    assert_eq!(ingest(&s, Some(&last)).await, 200);
+    assert_eq!(key_touches(&s).await["tracked"], 2, "revoked keys never come back");
+
+    let info = s.client.get(s.u("/api/v1/system/info")).send().await.unwrap().text().await.unwrap();
+    for (_, key) in keys.iter().chain([&(0, last)]) {
+        assert!(!info.contains(&key[4..]) && !info.contains(&server::auth::sha256_hex(key)), "no key or hash reported");
+    }
+    s.stop().await;
+}

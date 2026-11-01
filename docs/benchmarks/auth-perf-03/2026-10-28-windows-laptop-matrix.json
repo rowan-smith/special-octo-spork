@@ -1,0 +1,629 @@
+{
+  "options": {
+    "cells": ".",
+    "minRuns": 3
+  },
+  "report": {
+    "few-churn": {
+      "events/s": {
+        "baseline": [
+          13161.885516353119,
+          13616.767820499605,
+          11736.486647010823
+        ],
+        "candidate": [
+          13196.795221088945,
+          13807.983816198594,
+          14181.476850949812
+        ],
+        "baselineMedian": 13161.885516353119,
+        "candidateMedian": 13807.983816198594
+      },
+      "CPU µs/event": {
+        "baseline": [
+          496.8104349071559,
+          493.548996160866,
+          559.7118922346486
+        ],
+        "candidate": [
+          503.96284675585554,
+          479.8304253641944,
+          469.272887854072
+        ],
+        "baselineMedian": 496.8104349071559,
+        "candidateMedian": 479.8304253641944
+      },
+      "ACK p50 ms": {
+        "baseline": [
+          0.587,
+          0.574,
+          0.657
+        ],
+        "candidate": [
+          0.59,
+          0.563,
+          0.551
+        ],
+        "baselineMedian": 0.587,
+        "candidateMedian": 0.563
+      },
+      "ACK p99 ms": {
+        "baseline": [
+          1.049,
+          0.982,
+          1.153
+        ],
+        "candidate": [
+          1.052,
+          0.989,
+          0.941
+        ],
+        "baselineMedian": 1.049,
+        "candidateMedian": 0.989
+      },
+      "ACK max ms": {
+        "baseline": [
+          108.911,
+          20.506,
+          26.574
+        ],
+        "candidate": [
+          21.618,
+          29.32,
+          18.723
+        ],
+        "baselineMedian": 26.574,
+        "candidateMedian": 21.618
+      },
+      "auth p50 ms": {
+        "baseline": [
+          0.442,
+          0.435,
+          0.49
+        ],
+        "candidate": [
+          0.45,
+          0.425,
+          0.412
+        ],
+        "baselineMedian": 0.442,
+        "candidateMedian": 0.425
+      },
+      "auth p99 ms": {
+        "baseline": [
+          0.898,
+          0.821,
+          0.968
+        ],
+        "candidate": [
+          0.857,
+          0.834,
+          0.795
+        ],
+        "baselineMedian": 0.898,
+        "candidateMedian": 0.834
+      },
+      "auth max ms": {
+        "baseline": [
+          52.014,
+          2.957,
+          3.657
+        ],
+        "candidate": [
+          3.902,
+          3.423,
+          3.739
+        ],
+        "baselineMedian": 3.657,
+        "candidateMedian": 3.739
+      },
+      "429s": {
+        "baseline": [
+          1280418,
+          1307718,
+          1162906
+        ],
+        "candidate": [
+          1262197,
+          1340445,
+          1363396
+        ],
+        "baselineMedian": 1280418,
+        "candidateMedian": 1340445
+      },
+      "churn rounds": {
+        "baseline": [
+          15398,
+          15776,
+          14545
+        ],
+        "candidate": [
+          15412,
+          15840,
+          16035
+        ],
+        "baselineMedian": 15398,
+        "candidateMedian": 15840
+      },
+      "churn round p99 ms": {
+        "baseline": [
+          3.139,
+          2.648,
+          3.372
+        ],
+        "candidate": [
+          3.081,
+          2.809,
+          2.604
+        ],
+        "baselineMedian": 3.139,
+        "candidateMedian": 2.809
+      },
+      "peak MiB": {
+        "baseline": [
+          117.484375,
+          116.37890625,
+          117.08984375
+        ],
+        "candidate": [
+          115.625,
+          116.08984375,
+          116.93359375
+        ],
+        "baselineMedian": 117.08984375,
+        "candidateMedian": 116.08984375
+      },
+      "RSS after settle MiB": {
+        "baseline": [
+          82.30859375,
+          105.546875,
+          87.09375
+        ],
+        "candidate": [
+          83.03125,
+          46.4609375,
+          57.94140625
+        ],
+        "baselineMedian": 87.09375,
+        "candidateMedian": 57.94140625
+      },
+      "RSS slope MiB/min": {
+        "baseline": [
+          -38.58332311089303,
+          10.072544642857142,
+          -6.237723214285714
+        ],
+        "candidate": [
+          -58.8515625,
+          -26.275044642857143,
+          43.02321428571429
+        ],
+        "baselineMedian": -6.237723214285714,
+        "candidateMedian": -26.275044642857143
+      },
+      "peak tracked": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          9,
+          9,
+          9
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 9
+      },
+      "tracked after settle": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          8,
+          8,
+          8
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 8
+      },
+      "peak waiting": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          3,
+          3,
+          7
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 3
+      },
+      "writes queued": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          15428,
+          15856,
+          16051
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 15856
+      },
+      "write batches": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          15420,
+          15851,
+          16041
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 15851
+      },
+      "deferred": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          0,
+          0,
+          0
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 0
+      },
+      "dropped": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          0,
+          0,
+          0
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 0
+      },
+      "forgotten": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          15412,
+          15840,
+          16035
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 15840
+      }
+    },
+    "cap-churn": {
+      "events/s": {
+        "baseline": [
+          9159.198154574346,
+          7600.781617327981,
+          8559.095837118793
+        ],
+        "candidate": [
+          8874.335178543015,
+          12269.651875757916,
+          10143.073969667546
+        ],
+        "baselineMedian": 8559.095837118793,
+        "candidateMedian": 10143.073969667546
+      },
+      "CPU µs/event": {
+        "baseline": [
+          887.7966936839447,
+          1048.1809981960312,
+          952.8695875609214
+        ],
+        "candidate": [
+          680.504136754338,
+          533.5017344539381,
+          639.5966104463363
+        ],
+        "baselineMedian": 952.8695875609214,
+        "candidateMedian": 639.5966104463363
+      },
+      "ACK p50 ms": {
+        "baseline": [
+          0.589,
+          0.713,
+          0.635
+        ],
+        "candidate": [
+          0.734,
+          0.558,
+          0.664
+        ],
+        "baselineMedian": 0.635,
+        "candidateMedian": 0.664
+      },
+      "ACK p99 ms": {
+        "baseline": [
+          3.279,
+          3.709,
+          3.372
+        ],
+        "candidate": [
+          2.429,
+          1.502,
+          1.869
+        ],
+        "baselineMedian": 3.372,
+        "candidateMedian": 1.869
+      },
+      "ACK max ms": {
+        "baseline": [
+          138.131,
+          154.412,
+          154.364
+        ],
+        "candidate": [
+          76.002,
+          29.486,
+          37.629
+        ],
+        "baselineMedian": 154.364,
+        "candidateMedian": 37.629
+      },
+      "auth p50 ms": {
+        "baseline": [
+          0.451,
+          0.529,
+          0.478
+        ],
+        "candidate": [
+          0.551,
+          0.417,
+          0.492
+        ],
+        "baselineMedian": 0.478,
+        "candidateMedian": 0.492
+      },
+      "auth p99 ms": {
+        "baseline": [
+          1.412,
+          1.857,
+          1.547
+        ],
+        "candidate": [
+          2.283,
+          1.06,
+          1.409
+        ],
+        "baselineMedian": 1.547,
+        "candidateMedian": 1.409
+      },
+      "auth max ms": {
+        "baseline": [
+          3.849,
+          6.086,
+          4.431
+        ],
+        "candidate": [
+          50.936,
+          1.912,
+          7.44
+        ],
+        "baselineMedian": 4.431,
+        "candidateMedian": 7.44
+      },
+      "429s": {
+        "baseline": [
+          1416402,
+          1181096,
+          1305817
+        ],
+        "candidate": [
+          915959,
+          1273138,
+          1058453
+        ],
+        "baselineMedian": 1305817,
+        "candidateMedian": 1058453
+      },
+      "churn rounds": {
+        "baseline": [
+          8115,
+          7418,
+          7864
+        ],
+        "candidate": [
+          7316,
+          8907,
+          7909
+        ],
+        "baselineMedian": 7864,
+        "candidateMedian": 7909
+      },
+      "churn round p99 ms": {
+        "baseline": [
+          15.627,
+          17.429,
+          15.307
+        ],
+        "candidate": [
+          17.38,
+          7.735,
+          10.811
+        ],
+        "baselineMedian": 15.627,
+        "candidateMedian": 10.811
+      },
+      "peak MiB": {
+        "baseline": [
+          140.21875,
+          139.8671875,
+          139.4609375
+        ],
+        "candidate": [
+          127.640625,
+          124.87109375,
+          127.60546875
+        ],
+        "baselineMedian": 139.8671875,
+        "candidateMedian": 127.60546875
+      },
+      "RSS after settle MiB": {
+        "baseline": [
+          140.07421875,
+          132.58203125,
+          104.4921875
+        ],
+        "candidate": [
+          108.30859375,
+          53.72265625,
+          96.94140625
+        ],
+        "baselineMedian": 132.58203125,
+        "candidateMedian": 96.94140625
+      },
+      "RSS slope MiB/min": {
+        "baseline": [
+          20.101986128625477,
+          -7.447391235813366,
+          -62.05022321428571
+        ],
+        "candidate": [
+          -20.436911884293682,
+          50.72739684466019,
+          5.164184753987361
+        ],
+        "baselineMedian": -7.447391235813366,
+        "candidateMedian": 5.164184753987361
+      },
+      "peak tracked": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          4096,
+          4096,
+          4096
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 4096
+      },
+      "tracked after settle": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          4096,
+          4096,
+          4096
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 4096
+      },
+      "peak waiting": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          1024,
+          1008,
+          1024
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 1024
+      },
+      "writes queued": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          8217,
+          8222,
+          8222
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 8222
+      },
+      "write batches": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          1828,
+          1937,
+          1755
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 1828
+      },
+      "deferred": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          283585,
+          392173,
+          326087
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 326087
+      },
+      "dropped": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          330,
+          0,
+          172
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 172
+      },
+      "forgotten": {
+        "baseline": [
+          null,
+          null,
+          null
+        ],
+        "candidate": [
+          25,
+          30,
+          30
+        ],
+        "baselineMedian": null,
+        "candidateMedian": 30
+      }
+    }
+  },
+  "failures": []
+}

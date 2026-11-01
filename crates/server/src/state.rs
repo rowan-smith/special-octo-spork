@@ -1,6 +1,5 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use metadata::Metadata;
@@ -54,9 +53,8 @@ pub struct AppState {
     pub received_bytes: AtomicU64,
     pub received_requests: AtomicU64,
     pub http: reqwest::Client,
-    /// Last time each API key's `last_used_at` was persisted.
-    pub key_touch: Mutex<HashMap<i64, Instant>>,
-    /// Every active API key; decides whether ingestion is protected.
+    /// Every active API key; decides whether ingestion is protected. Also
+    /// tracks their last-used writes (AUTH-PERF-03).
     pub api_keys: Arc<crate::auth::ApiKeys>,
     /// Session cache and lookup timings (AUTH-PERF-02).
     pub sessions: crate::auth::Sessions,

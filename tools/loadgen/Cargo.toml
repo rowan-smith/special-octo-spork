@@ -32,3 +32,8 @@ path = "src/keychurn.rs"
 [[bin]]
 name = "sessionauth"
 path = "src/sessionauth.rs"
+
+# API key last-used bookkeeping under many keys and key churn (AUTH-PERF-03).
+[[bin]]
+name = "keytouch"
+path = "src/keytouch.rs"

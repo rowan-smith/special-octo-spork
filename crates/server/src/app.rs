@@ -12,8 +12,8 @@
 
 use std::future::Future;
 use std::pin::{Pin, pin};
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -194,7 +194,6 @@ impl App {
             received_bytes: AtomicU64::new(0),
             received_requests: AtomicU64::new(0),
             http,
-            key_touch: Mutex::new(Default::default()),
             sessions: Default::default(),
             api_keys: Arc::new(api_keys),
             shutdown: rx.clone(),
