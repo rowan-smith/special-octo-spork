@@ -63,7 +63,7 @@ rss() {
 run() {
   local name=$1 binary=$2 cell=$3 keys=$4 churn=$5 rep=$6
   local dir="$OUT/$name/$cell/run$rep" data="$WORK/data-$name-$cell-$rep"
-  local port=$((20000 + RANDOM % 20000))
+  local port=$((20000 + RANDOM % 12000)) # below the ephemeral ranges
   mkdir -p "$dir"
   VYRTEL_AUTH_ADMIN_PASSWORD=$PASSWORD VYRTEL_ALERTS_ENABLED=false \
     "$binary" --data-dir "$data" --bind "127.0.0.1:$port" --log-level error >"$dir/server.log" 2>&1 &
