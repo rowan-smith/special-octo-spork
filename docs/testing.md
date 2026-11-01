@@ -36,6 +36,7 @@ Next to the code (`#[cfg(test)]` modules). Highlights:
 | Data-directory check: new and interrupted first-start directories accepted; missing parts, inventory files missing or truncated, an empty metadata database refused as incomplete; manifests, metadata and telemetry of another layout or without one, and unidentified telemetry, refused and never accepted; `accept_incomplete` returns the incomplete problems instead; the inventory is dropped on start; the `check-data-dir` report | `crates/server/src/datadir.rs` |
 | Environment variables under a settings prefix that are not settings stop startup (TC2) | `crates/server/src/config.rs` |
 | API key registry (AUTH-PERF-01): key writes off the request path, bounded serialised changes, failure/cancellation ordering, one admission decision per request, parity with the stored keys across restarts ([details](#api-key-changes-and-authentication-auth-perf-01)) | `crates/server/src/auth.rs` |
+| API key last-used bookkeeping (AUTH-PERF-03): the one-minute throttle on a fake clock, revoked keys reclaimed and never re-added, entry/queue/writer caps, failure, panic, shutdown and restart ([details](#api-key-last-used-tracking-auth-perf-03)) | `crates/server/src/auth.rs`, `crates/metadata/tests/store.rs` |
 
 ## Property tests (proptest)
 
@@ -272,7 +273,8 @@ talks HTTP to it:
   [below](#query-budget-and-cancellation-tests));
 * missing auth, bad auth, ingest-only keys, sessions, logout, revocation;
   a key write stalled in SQLite holds up no request (AUTH-PERF-01, see
-  [below](#api-key-changes-and-authentication-auth-perf-01));
+  [below](#api-key-changes-and-authentication-auth-perf-01)); last-used
+  times recorded and revoked keys' bookkeeping reclaimed (AUTH-PERF-03);
 * pagination, time ranges, empty results, facets, histograms;
 * live stream (SSE) delivery and filtering, and that open streams do not
   block shutdown;
@@ -896,7 +898,7 @@ cargo test -p server --test integration auth::            # over HTTP, including
 
 No per-request database read was added: authentication still only reads
 the in-memory set, and last-used is still persisted at most once a minute
-per key.
+per key (bounded since AUTH-PERF-03, [below](#api-key-last-used-tracking-auth-perf-03)).
 
 #### API key churn benchmark
 
@@ -1199,6 +1201,159 @@ candidate-affecting change, this invalidates earlier
 which must be taken again on the final candidate with this harness
 included.
 
+### API key last-used tracking (AUTH-PERF-03)
+
+Requests authenticated by API key record the key's last-used time in
+bounded bookkeeping: at most once a minute per key, at most 4096 keys
+remembered (only active ones), at most 1024 waiting and one writer thread
+([design](architecture.md#api-key-last-used-tracking),
+[API semantics](api.md#api-keys)); `/api/v1/system/info` reports it
+(`apiKeyTouch`).
+
+```bash
+cargo test -p server --lib auth::                         # throttle, revoke race, churn, caps, failures, restart
+cargo test -p server --test integration auth::            # over HTTP: last-used written, revoked keys reclaimed
+cargo test -p metadata --test store touching_api_keys     # the batched write skips revoked keys
+node --test scripts/bench/*.test.mjs                      # the benchmark report's evidence and budget checks
+```
+
+| Acceptance criterion (AUTH-PERF-03) | Tests and evidence |
+|---|---|
+| AC1: revoked keys' entries reclaimed; a request admitted before a revoke cannot re-add them; numeric entry/byte and queue/worker bounds | `auth::tests::revoked_keys_leave_no_last_used_state` (a revoke drops its key's entry; touches with the set from before the revoke are `Retired` and add nothing), `a_touch_racing_a_revoke_is_dropped_when_the_revoke_publishes` (deterministic: a touch queued while the revoke's write is held behind a barrier loses its entry when the revoke publishes, and later touches with the old set are refused), `concurrent_touches_and_revokes_leave_only_active_keys` (4 touchers against 32 revokes); metadata `touching_api_keys_in_a_batch_skips_revoked_keys`; integration `auth::api_key_last_used_is_recorded_and_revoked_keys_are_reclaimed`. Bounds: `KEY_TOUCH_ENTRIES` 4096 × `KEY_TOUCH_ENTRY_BYTES` 48 = 192 KiB, `MAX_PENDING_KEY_TOUCHES` 1024, 1 writer; every test ends with `assert_bounded` |
+| AC2: coalesced, rate-limited writes; no unbounded `spawn_blocking`; at capacity defer/drop with counters, never reject ingest or bypass auth; no write storm on eviction | `a_stalled_writer_bounds_waiting_keys_and_threads` (a runtime with 2 blocking threads: while the writer is stalled, 4,999 more keys give exactly 1,024 waiting and 3,975 dropped, decided without waiting; a waiting key used again is not queued twice; the other blocking thread stays free; on release the waiting keys are written in one batch, and a dropped key is written on its next use); `high_cardinality_keys_at_the_cap_are_deferred_not_written` (5,096 keys round robin for 58 fake-clock seconds: exactly 4,096 writes, the other 1,000 deferred 30 times each without any write; once the entries are a minute old the 1,000 get in, written once each). The touch result never affects the request: `require_ingest` and `require_user` ignore it |
+| AC3: approximate last-used and the one-minute throttle kept; failure, cancellation and shutdown release everything; no keys or hashes in logs or metrics | `last_used_writes_keep_the_one_minute_throttle` (fake clock: not written again at 0 s, 1 s or exactly 60 s, written again at 60 s + 1 ns; per key); `failed_and_panicking_writes_release_everything` (a failing database: the writer is released, the key is retried after the interval and not before; a panicking writer gives back its waiting keys, which queue again on next use); `a_writer_that_never_runs_releases_everything` (a runtime already shut down); integration test checks `system/info` contains no key or hash. Counters are aggregate (`apiKeyTouch`); the one log line names a count and the SQLite error only |
+| AC4: ≥10,000 sequential create → use → revoke with bounded active keys; concurrent touch/revoke; saturated worker/queue; slow/failed DB; restart | `ten_thousand_revoked_keys_leave_nothing_behind` (10,000 rounds through the real registry and SQLite with at most 8 keys active: at most 9 entries at any time, 8 at the end, 9,992 forgotten, every active key's `last_used_at` written); the stalled, failing and concurrent tests above; `last_used_survives_a_restart_and_bookkeeping_starts_empty` |
+| AC5: before/after entries, queue, workers, heap/RSS slope, CPU, write rate, p99 ingest/auth latency, post-load cleanup; predeclared budgets | `tools/loadgen` `keytouch`, `scripts/bench/keytouch.sh` and `keytouch-report.mjs`, below |
+
+The ingest policy (no ingest key = open, an ingest key = protected) and
+query/UI authentication are unchanged: `ingest_protection_*`,
+`ingestion_without_keys_leaves_the_rest_of_the_api_closed` and
+`ui_api_requires_session_or_admin_key` pass unchanged, and the new
+integration test checks that revoking the last ingest key reopens
+ingestion and that revoked keys are then refused once another ingest key
+exists. No configuration was added and the schema is unchanged.
+
+#### API key last-used benchmark
+
+`keytouch` logs in as the admin, creates the cell's active ingest keys and
+for the duration runs 16 closed-loop producers that use those keys in turn
+(each request the next key), an auth probe (a keyless ingest request every
+10 ms, answered 401) and one churner that creates an ingest key, ingests
+one event with it, revokes it and waits 2 ms, so revoked keys accumulate
+with the run. It samples `/api/v1/system/info` every second, waits 5 s
+after the load, samples again (post-load cleanup) and counts the
+acknowledged events back. `scripts/bench/keytouch.sh` runs a matched
+baseline and candidate on fresh data directories for each cell, alternating
+the binaries within each repetition, and records the server's CPU seconds
+(from just before the keys are created), peak memory and RSS every 5 s:
+
+* `few-churn`: 8 active keys, churn on;
+* `cap-churn`: 5,000 active keys (past the 4,096-entry cap), churn on.
+
+```bash
+git worktree add ../vyrtel-baseline <baseline-sha> && (cd ../vyrtel-baseline && cargo build --release -p server)
+cargo build --release -p server -p loadgen
+RUNS=3 DURATION=70s scripts/bench/keytouch.sh ../vyrtel-baseline/target/release/vyrtel target/release/vyrtel
+node scripts/bench/keytouch-report.mjs target/keytouch --json target/keytouch/report.json
+```
+
+Settings: `RUNS`, `DURATION`, `FEW`/`CAP` (active keys), `PRODUCERS`,
+`CHURN` (pause between rounds), `CELLS`, `OUT`, `KEYTOUCH`. The server runs
+with its default configuration plus a random admin password and alerts off;
+the generator runs on the same host. Runs are 70 s so each key's one-minute
+throttle expires within the run.
+
+**Evidence completeness**, checked by `keytouch-report.mjs` before any
+budget (exit 1 when incomplete): both cells (or those matching `--cells`)
+for both binaries and no others; at least `--min-runs` (default 3) usable
+runs per binary, the same number for both, with the same workload; a run is
+usable when its files parse, its gated values are finite, it acknowledged
+events, measured the auth probe and completed churn rounds; a candidate run
+must also report `apiKeyTouch`.
+
+**Budgets**, fixed before the first run and checked by
+`keytouch-report.mjs` (exit 1 when missed):
+
+* every run, both binaries: every acknowledged event persisted; no ingest
+  401, 5xx, timeout or transport error; every key create and revoke
+  succeeded and no churn ingest got a 401, 5xx, timeout or transport error
+  (429s from ingest admission are reported, not failures); every auth probe
+  answered 401;
+* every candidate run: at most 4,096 keys tracked and 1,024 waiting at
+  every sample and at most 1 writer; after the settle period nothing
+  waiting, no writer, at most as many keys tracked as are active (not
+  growing with the revoked ones), and no failed write batch;
+* per cell, candidate median against baseline median: accepted events/s at
+  least 90%; server CPU per accepted event at most 110%; auth probe p99 and
+  ingest ACK p99 at most max(110%, +1 ms); peak memory at most 110%.
+
+**Results, 2026-10-28** (report and raw per-run values in
+[`docs/benchmarks/auth-perf-03/`](benchmarks/auth-perf-03/)). Baseline
+`c232a6f` (main before this change), candidate: this change on top of it;
+both `cargo build --release` with Rust 1.96.1 on Windows 11, Intel Core
+Ultra 7 155H (16 cores, 22 threads), 31.5 GB, generator on the same host,
+70 s per run plus 5 s settle, uninstrumented (no profiler attached).
+Medians of 3 runs; **all budgets met** on the first pass:
+
+| Cell | events/s base → cand | ACK p99 ms | auth p99 ms | CPU µs/event | peak MiB |
+|---|---|---|---|---|---|
+| few-churn | 13,162 → 13,808 | 1.05 → 0.99 | 0.90 → 0.83 | 497 → 480 | 117 → 116 |
+| cap-churn | 8,559 → 10,143 | 3.37 → 1.87 | 1.55 → 1.41 | 953 → 640 | 140 → 128 |
+
+Every run of both binaries persisted every acknowledged event, with no
+ingest 401, 5xx, timeout or transport error and every key create and
+revoke succeeding (about 15,400–16,000 churn rounds per `few-churn` run and
+7,300–8,900 per `cap-churn` run).
+
+Bookkeeping, candidate (medians; `apiKeyTouch`):
+
+| Cell | peak tracked | tracked after settle | peak waiting | writer threads | rows written (per s) | write batches | deferred | dropped | revoked keys forgotten |
+|---|---|---|---|---|---|---|---|---|---|
+| few-churn | 9 | 8 | 3 | ≤ 1 | 15,856 (≈ 227) | 15,851 | 0 | 0 | 15,840 |
+| cap-churn | 4,096 | 4,096 | 1,024 | ≤ 1 | 8,222 (≈ 117) | 1,828 | 326,087 | 172 | 30 |
+
+The baseline does not report its bookkeeping. From its code, it keeps one
+map entry for every key ever authenticated and never removes one, and
+spawns one blocking task per due write: over these runs that is about
+15,400 retained entries and as many spawned writes per `few-churn` run, and
+about 12,900 of each per `cap-churn` run (the churned keys plus the 5,000
+active keys), growing for as long as keys are churned. The candidate keeps
+at most the active keys (8) or the cap (4,096) and at most one writer
+thread, independent of how many keys were revoked, and nothing was left
+waiting after the load. In `cap-churn` the 4,096 tracked keys were all
+written within the minute, so the other active keys and every churned key
+were deferred (not written) rather than evicting anything: 8,222 rows were
+written there against roughly 12,900 baseline writes. Touches count
+authenticated requests, including those then refused `429` by ingest
+admission, as before.
+
+Retained heap: at about 50 bytes per baseline entry, its growth here is
+under 1 MB per run, below this host's RSS noise. The RSS slopes over the
+second half of the load (sampled every 5 s from the Windows working set)
+range from −62 to +51 MiB/min for both binaries alike, so they neither
+show nor rule out a slope difference at these run lengths; RSS after the
+5 s settle was lower for the candidate (median 58 vs 87 MiB `few-churn`,
+97 vs 133 MiB `cap-churn`), within the same spread.
+
+**Open before 0.1.2 performance sign-off:** none of these budgets. The
+retained-memory comparison needs a longer authenticated soak on the
+dedicated Linux benchmark host (where `system/info` reports RSS itself),
+with the generator on a separate machine: `CELLS='^cap-churn$'` at the
+[PERF-GATE-1](https://github.com/rowan-smith/Vyrtel/issues/170) soak
+duration, comparing the RSS slope and the number of revoked keys.
+
+**Limitations.** One laptop, generator and server sharing 22 threads, no
+CPU pinning, 3 runs per cell. Most ingest requests are 429s from ingest
+admission (16 producers exceed the derived `ingest.max_concurrent` here),
+so throughput is of an admission-saturated server. Write rate and queue
+depth are the candidate's own counters; the baseline's are derived from
+its code, not measured. CPU is process time from `Get-Process` (including
+creating the active keys), memory the Windows peak and current working set.
+No profile was taken. As a candidate-affecting change, this invalidates
+earlier [PERF-GATE-1](https://github.com/rowan-smith/Vyrtel/issues/170)
+evidence, which must be taken again on the final candidate with this
+harness included.
+
 ## Frontend tests
 
 Vitest + React Testing Library in `web/tests/unit/`:
@@ -1414,6 +1569,21 @@ Options: `--auth session|key`, `--workload auth|query|mixed`,
 `--ingest-concurrency`, `--batch`, `--write-interval`, `--probe-interval`,
 `--timeout`, `--out`, `--label`. It writes `summary.json` (no credentials)
 and exits with status 1 if any acknowledged event is missing afterwards.
+
+`keytouch` uses many API keys in turn while one churner creates, uses and
+revokes keys, sampling the server's RSS and last-used bookkeeping (see
+[API key last-used benchmark](#api-key-last-used-benchmark)):
+
+```bash
+cargo run --release -p loadgen --bin keytouch -- --target http://localhost:8080   --active-keys 5000 --concurrency 16 --churn-interval 2ms --duration 70s
+```
+
+Options: `--admin-password` (or `VYRTEL_AUTH_ADMIN_PASSWORD`),
+`--admin-username`, `--duration`, `--active-keys`, `--concurrency`,
+`--batch`, `--churn-interval` (0 = no churn), `--probe-interval`,
+`--sample-interval`, `--settle`, `--timeout`, `--out`, `--label`. It writes
+`summary.json` (no keys) and exits with status 1 if any acknowledged event
+is missing afterwards.
 
 Observed on the same laptop with a release build (`--rate 10000 --duration
 30s --traces-every 200`, default config):

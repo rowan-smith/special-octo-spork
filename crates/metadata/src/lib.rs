@@ -535,9 +535,26 @@ impl Metadata {
     }
 
     pub fn touch_api_key(&self, id: i64) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        c.prepare_cached("UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1")?.execute(params![id, now_ms()])?;
-        Ok(())
+        self.touch_api_keys(&[id]).map(|_| ())
+    }
+
+    /// Set `last_used_at` to now for every active key in `ids`, in one
+    /// transaction. Revoked keys are left as they are. Returns how many
+    /// keys were updated.
+    pub fn touch_api_keys(&self, ids: &[i64]) -> Result<usize> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        let now = now_ms();
+        let mut n = 0;
+        {
+            let mut st =
+                tx.prepare_cached("UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1 AND revoked_at IS NULL")?;
+            for id in ids {
+                n += st.execute(params![id, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     pub fn revoke_api_key(&self, id: i64) -> Result<()> {

@@ -11,7 +11,7 @@
 //! none does (see [`ApiKeys`]). The boundaries are kept small so OIDC etc.
 //! can be added later as another way of producing a [`Principal`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -134,6 +134,14 @@ impl KeySet {
         self.by_hash.insert(hash, (id, scope));
     }
 
+    fn ids(&self) -> HashSet<i64> {
+        self.by_hash.values().map(|(id, _)| *id).collect()
+    }
+
+    fn has_id(&self, id: i64) -> bool {
+        self.by_hash.values().any(|(key_id, _)| *key_id == id)
+    }
+
     fn remove(&mut self, id: i64) {
         let Self { by_hash, ingest } = self;
         by_hash.retain(|_, (key_id, scope)| {
@@ -155,29 +163,44 @@ impl KeySet {
 /// wait for SQLite. Changes take turns on an async mutex (at most
 /// [`MAX_PENDING_KEY_CHANGES`] waiting or running), write SQLite on the
 /// blocking pool, and only after the write commits publish the next set.
-/// Lock order: `changes`, then `current`; `current` is never held across
-/// anything else.
+/// Lock order: `changes`, then `current`; `touches`, then `current`;
+/// `current` is never held across anything else. It also keeps the keys'
+/// last-used bookkeeping (see [`ApiKeys::touch`]).
 pub struct ApiKeys {
     current: RwLock<Arc<KeySet>>,
     changes: Arc<Mutex<()>>,
     pending: Arc<Semaphore>,
+    touches: std::sync::Mutex<Touches>,
+    touch_stats: TouchStats,
+    write_touches: TouchWrite,
 }
 
 impl ApiKeys {
+    /// A registry whose last-used writes go nowhere (for tests).
     pub fn new(keys: KeySet) -> Self {
+        Self::with_touch_writer(keys, Arc::new(|ids: &[i64]| Ok(ids.len())))
+    }
+
+    /// A registry whose last-used writes are made by `write` (the ids to
+    /// touch; returns how many were updated), on the blocking pool.
+    pub fn with_touch_writer(keys: KeySet, write: TouchWrite) -> Self {
         Self {
             current: RwLock::new(Arc::new(keys)),
             changes: Arc::new(Mutex::new(())),
             pending: Arc::new(Semaphore::new(MAX_PENDING_KEY_CHANGES)),
+            touches: Default::default(),
+            touch_stats: Default::default(),
+            write_touches: write,
         }
     }
 
-    pub fn load(m: &Metadata) -> metadata::Result<Self> {
+    pub fn load(m: &Arc<Metadata>) -> metadata::Result<Self> {
         let mut keys = KeySet::default();
         for (id, hash, scope) in m.active_api_keys()? {
             keys.add(hash, id, scope);
         }
-        Ok(Self::new(keys))
+        let m = m.clone();
+        Ok(Self::with_touch_writer(keys, Arc::new(move |ids: &[i64]| m.touch_api_keys(ids))))
     }
 
     /// The current keys. Hold the result only as long as one decision
@@ -201,7 +224,8 @@ impl ApiKeys {
     /// it waits for its turn cancels the change; once the write has started
     /// it runs to the end and is published, and keeps its turn until then,
     /// so a later change can never be overtaken by it. Requests admitted
-    /// before a change are not affected by it.
+    /// before a change are not affected by it, except that the last-used
+    /// bookkeeping of keys it removes is dropped in the same step.
     pub async fn change<T, W, A>(self: &Arc<Self>, write: W, apply: A) -> ApiResult<T>
     where
         T: Send + 'static,
@@ -218,7 +242,11 @@ impl ApiKeys {
             let out = write()?;
             let mut next = KeySet::clone(&keys.snapshot());
             apply(&mut next, &out);
-            *keys.current.write().unwrap() = Arc::new(next);
+            let next = Arc::new(next);
+            *keys.current.write().unwrap() = next.clone();
+            // After the swap: a touch that checks the current set from
+            // here on finds a removed key gone (see `touch_at`).
+            keys.forget_removed(&next);
             Ok(out)
         })
         .await?
@@ -243,6 +271,251 @@ impl ApiKeys {
         let m = m.clone();
         self.change(move || m.revoke_api_key(id), move |keys, ()| keys.remove(id)).await
     }
+
+    /// Note that key `id`, admitted by `admitted` (it must be in that set),
+    /// was used: see [`Touches`].
+    /// Never fails and never waits for SQLite; the request goes ahead
+    /// whatever this decides.
+    pub fn touch(self: &Arc<Self>, id: i64, admitted: &Arc<KeySet>) -> Touch {
+        self.touch_at(id, admitted, Instant::now())
+    }
+
+    /// [`ApiKeys::touch`] at `now` (a fake clock in tests).
+    fn touch_at(self: &Arc<Self>, id: i64, admitted: &Arc<KeySet>, now: Instant) -> Touch {
+        let s = &self.touch_stats;
+        let mut t = self.touches.lock().unwrap();
+        if t.last.get(&id).is_some_and(|&last| !t.stale(last, now)) {
+            return Touch::Throttled;
+        }
+        // Checked under `touches`, which `forget_removed` takes only after
+        // publishing: either this sees the key gone, or its entry is
+        // removed after this inserts it.
+        let current = self.snapshot();
+        if !Arc::ptr_eq(&current, admitted) && !current.has_id(id) {
+            s.retired.fetch_add(1, Ordering::Relaxed);
+            return Touch::Retired;
+        }
+        if !t.pending.contains(&id) && t.pending.len() >= MAX_PENDING_KEY_TOUCHES {
+            s.dropped.fetch_add(1, Ordering::Relaxed);
+            return Touch::Dropped;
+        }
+        if !t.last.contains_key(&id) && t.last.len() >= KEY_TOUCH_ENTRIES && !t.sweep(now) {
+            s.deferred.fetch_add(1, Ordering::Relaxed);
+            return Touch::Deferred;
+        }
+        t.remember(id, now);
+        t.pending.insert(id);
+        s.queued.fetch_add(1, Ordering::Relaxed);
+        s.peak_pending.fetch_max(t.pending.len() as u64, Ordering::Relaxed);
+        let start = !t.writing;
+        t.writing = true;
+        drop(t);
+        if start {
+            let writer = TouchWriter { keys: self.clone(), finished: false };
+            tokio::task::spawn_blocking(move || writer.run());
+        }
+        Touch::Queued
+    }
+
+    /// Drop the bookkeeping of every key not in `keys` (just published).
+    fn forget_removed(&self, keys: &KeySet) {
+        let mut t = self.touches.lock().unwrap();
+        if t.last.is_empty() && t.pending.is_empty() {
+            return;
+        }
+        let ids = keys.ids();
+        let before = t.last.len();
+        t.last.retain(|id, _| ids.contains(id));
+        t.pending.retain(|id| ids.contains(id));
+        self.touch_stats.forgotten.fetch_add((before - t.last.len()) as u64, Ordering::Relaxed);
+    }
+
+    pub fn touch_snapshot(&self) -> serde_json::Value {
+        let s = &self.touch_stats;
+        let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let (tracked, pending, writing) = {
+            let t = self.touches.lock().unwrap();
+            (t.last.len(), t.pending.len(), t.writing)
+        };
+        serde_json::json!({
+            "tracked": tracked, "trackedCapacity": KEY_TOUCH_ENTRIES,
+            "trackedBytes": tracked * KEY_TOUCH_ENTRY_BYTES,
+            "trackedByteCapacity": KEY_TOUCH_ENTRIES * KEY_TOUCH_ENTRY_BYTES,
+            "pending": pending, "pendingCapacity": MAX_PENDING_KEY_TOUCHES, "peakPending": n(&s.peak_pending),
+            "writers": usize::from(writing), "writerCapacity": 1,
+            "queued": n(&s.queued), "written": n(&s.written), "batches": n(&s.batches),
+            "failedBatches": n(&s.failed_batches), "abandoned": n(&s.abandoned),
+            "dropped": n(&s.dropped), "deferred": n(&s.deferred), "retired": n(&s.retired),
+            "forgotten": n(&s.forgotten),
+        })
+    }
+}
+
+/// How often a key's last-used time is persisted at most: a key used again
+/// within this of its last queued write is not written (the pre-existing
+/// one-minute throttle).
+pub const KEY_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Most keys whose last write time is remembered. Only entries younger than
+/// [`KEY_TOUCH_INTERVAL`] matter (an older one would be written anyway), so
+/// a full map evicts only those; while every entry is younger, a key not in
+/// it is not written (`deferred`) until one ages out, so eviction can never
+/// turn requests into writes.
+pub const KEY_TOUCH_ENTRIES: usize = 4096;
+
+/// What one remembered key costs, counted generously: the id and time and
+/// the map's slot and control byte. 4096 entries: 192 KiB.
+pub const KEY_TOUCH_ENTRY_BYTES: usize = 48;
+
+/// Most keys waiting for their last-used write. Further keys are not
+/// written (`dropped`) until the queue drains: they are tried again on
+/// their next request.
+pub const MAX_PENDING_KEY_TOUCHES: usize = 1024;
+
+/// Writes last-used times: given the ids, sets them to now and returns how
+/// many were updated.
+pub type TouchWrite = Arc<dyn Fn(&[i64]) -> metadata::Result<usize> + Send + Sync>;
+
+/// What [`ApiKeys::touch`] did. Only bookkeeping: the request goes ahead
+/// in every case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Touch {
+    /// Queued for writing.
+    Queued,
+    /// Written or queued less than [`KEY_TOUCH_INTERVAL`] ago.
+    Throttled,
+    /// The key was revoked after this request was admitted.
+    Retired,
+    /// [`MAX_PENDING_KEY_TOUCHES`] keys are already waiting.
+    Dropped,
+    /// [`KEY_TOUCH_ENTRIES`] keys were all written too recently to forget.
+    Deferred,
+}
+
+/// API key last-used bookkeeping (AUTH-PERF-03). `last_used_at` is
+/// approximate and informational: nothing is decided by it.
+///
+/// * A key is written at most once per [`KEY_TOUCH_INTERVAL`] (from when it
+///   was queued, whether or not the write then succeeds).
+/// * At most [`KEY_TOUCH_ENTRIES`] keys are remembered (192 KiB), and only
+///   active ones: a revoke drops its key's entry when it publishes, and a
+///   request admitted before the revoke cannot add it back.
+/// * At most [`MAX_PENDING_KEY_TOUCHES`] keys wait, each once however
+///   often it is used, and one blocking thread writes them, as many as are
+///   waiting in one transaction. Nothing else is spawned or waited on.
+/// * A failed or panicking write, or a writer that never runs (shutdown),
+///   gives everything back. Waiting keys are not written at exit.
+#[derive(Default)]
+struct Touches {
+    /// When each key was last queued for writing.
+    last: HashMap<i64, Instant>,
+    /// No entry of `last` is stale before this (a lower bound), so a full
+    /// map is swept only when it can free something.
+    stale_from: Option<Instant>,
+    /// Keys waiting for the writer.
+    pending: HashSet<i64>,
+    /// The writer is running (there is at most one).
+    writing: bool,
+    /// The last write failed (to log failures once, not per batch).
+    failing: bool,
+}
+
+impl Touches {
+    fn stale(&self, last: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(last) > KEY_TOUCH_INTERVAL
+    }
+
+    fn remember(&mut self, id: i64, now: Instant) {
+        self.last.insert(id, now);
+        let at = now + KEY_TOUCH_INTERVAL;
+        self.stale_from = Some(self.stale_from.map_or(at, |s| s.min(at)));
+    }
+
+    /// Forget stale entries; whether there is room now.
+    fn sweep(&mut self, now: Instant) -> bool {
+        if self.stale_from.is_some_and(|s| now <= s) {
+            return false;
+        }
+        self.last.retain(|_, last| now.saturating_duration_since(*last) <= KEY_TOUCH_INTERVAL);
+        self.stale_from = self.last.values().min().map(|&oldest| oldest + KEY_TOUCH_INTERVAL);
+        self.last.len() < KEY_TOUCH_ENTRIES
+    }
+}
+
+/// Last-used bookkeeping counted since the process started, reported by
+/// `/api/v1/system/info` (`apiKeyTouch`). Only atomics; no key ids.
+#[derive(Debug, Default)]
+struct TouchStats {
+    queued: AtomicU64,
+    written: AtomicU64,
+    batches: AtomicU64,
+    failed_batches: AtomicU64,
+    /// Waiting keys given up because the writer panicked or never ran.
+    abandoned: AtomicU64,
+    dropped: AtomicU64,
+    deferred: AtomicU64,
+    retired: AtomicU64,
+    forgotten: AtomicU64,
+    peak_pending: AtomicU64,
+}
+
+/// The one writer: writes waiting keys until none are left. However it
+/// ends (a panic, or never running because the runtime shut down), the
+/// writer slot and the keys it did not write are given back.
+struct TouchWriter {
+    keys: Arc<ApiKeys>,
+    finished: bool,
+}
+
+impl TouchWriter {
+    fn run(mut self) {
+        loop {
+            let batch: Vec<i64> = {
+                let mut t = self.keys.touches.lock().unwrap();
+                if t.pending.is_empty() {
+                    t.writing = false;
+                    self.finished = true;
+                    return;
+                }
+                t.pending.drain().collect()
+            };
+            let r = (self.keys.write_touches)(&batch);
+            let s = &self.keys.touch_stats;
+            s.batches.fetch_add(1, Ordering::Relaxed);
+            let mut t = self.keys.touches.lock().unwrap();
+            match r {
+                Ok(n) => {
+                    s.written.fetch_add(n as u64, Ordering::Relaxed);
+                    if std::mem::take(&mut t.failing) {
+                        tracing::info!("recording API key last-used times again");
+                    }
+                }
+                Err(e) => {
+                    s.failed_batches.fetch_add(1, Ordering::Relaxed);
+                    // These keys are tried again after the interval, not at
+                    // once, so a failing database gets no more writes.
+                    if !std::mem::replace(&mut t.failing, true) {
+                        tracing::warn!(keys = batch.len(), "could not record API key last-used times: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TouchWriter {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut t = self.keys.touches.lock().unwrap_or_else(|p| p.into_inner());
+        t.writing = false;
+        let abandoned: Vec<i64> = t.pending.drain().collect();
+        for id in &abandoned {
+            t.last.remove(id);
+        }
+        self.keys.touch_stats.abandoned.fetch_add(abandoned.len() as u64, Ordering::Relaxed);
+    }
 }
 
 /// Store a new key and accept it; an ingest key also protects ingestion
@@ -256,28 +529,10 @@ pub async fn revoke_api_key(state: &AppState, id: i64) -> ApiResult<()> {
     state.api_keys.revoke(&state.metadata, id).await
 }
 
-/// Note that key `id` was used: persist last-used at most once a minute per
-/// key, so ingestion does not turn into a stream of SQLite writes.
-fn touch_api_key(state: &AppState, id: i64) {
-    let touch = {
-        let mut t = state.key_touch.lock().unwrap();
-        let due = t.get(&id).is_none_or(|last| last.elapsed() > Duration::from_secs(60));
-        if due {
-            t.insert(id, Instant::now());
-        }
-        due
-    };
-    if touch {
-        let m = state.metadata.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = m.touch_api_key(id);
-        });
-    }
-}
-
 fn check_api_key(state: &AppState, key: &str) -> Result<Principal, ApiError> {
-    let (id, scope) = state.api_keys.snapshot().find(key)?;
-    touch_api_key(state, id);
+    let keys = state.api_keys.snapshot();
+    let (id, scope) = keys.find(key)?;
+    state.api_keys.touch(id, &keys);
     Ok(Principal::ApiKey { id, scope })
 }
 
@@ -566,9 +821,15 @@ pub async fn require_ingest(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let admitted = state.api_keys.snapshot().admit_ingest(req.headers())?;
+    let admitted = {
+        let keys = state.api_keys.snapshot();
+        let admitted = keys.admit_ingest(req.headers())?;
+        if let Some((id, _)) = &admitted {
+            state.api_keys.touch(*id, &keys);
+        }
+        admitted
+    };
     if let Some((id, scope)) = admitted {
-        touch_api_key(&state, id);
         req.extensions_mut().insert(Principal::ApiKey { id, scope });
     }
     Ok(next.run(req).await)
@@ -733,7 +994,7 @@ mod tests {
     }
 
     /// The published set equals what a restart would load.
-    fn assert_matches_store(keys: &ApiKeys, m: &Metadata) {
+    fn assert_matches_store(keys: &ApiKeys, m: &Arc<Metadata>) {
         assert_eq!(*keys.snapshot(), *ApiKeys::load(m).unwrap().snapshot());
     }
 
@@ -1294,5 +1555,395 @@ mod tests {
         assert_eq!(check(&s, &m, &other).await.unwrap().as_deref(), Some("admin"));
         assert_eq!(check(&s, &m, &token).await.unwrap(), None);
         assert_eq!(stat(&s, "lookups"), 2);
+    }
+
+    // ---- AUTH-PERF-03: bounded last-used bookkeeping -----------------------
+
+    fn tstat(keys: &ApiKeys, k: &str) -> u64 {
+        keys.touch_snapshot()[k].as_u64().unwrap()
+    }
+
+    /// Ids written so far, in order, by a writer that records them.
+    type Written = Arc<std::sync::Mutex<Vec<i64>>>;
+
+    fn recording() -> (TouchWrite, Written) {
+        let written = Written::default();
+        let w = written.clone();
+        (
+            Arc::new(move |ids: &[i64]| {
+                w.lock().unwrap().extend_from_slice(ids);
+                Ok(ids.len())
+            }),
+            written,
+        )
+    }
+
+    /// A registry of `n` active ingest keys, ids 1..=n.
+    fn active(n: i64, write: TouchWrite) -> Arc<ApiKeys> {
+        let mut set = KeySet::default();
+        for id in 1..=n {
+            set.add(format!("h{id}"), id, "ingest".into());
+        }
+        Arc::new(ApiKeys::with_touch_writer(set, write))
+    }
+
+    async fn idle(keys: &ApiKeys) {
+        until("the writer to finish", || {
+            let t = keys.touches.lock().unwrap();
+            !t.writing && t.pending.is_empty()
+        })
+        .await;
+    }
+
+    /// Every bound holds, and only active keys are remembered or waiting.
+    fn assert_bounded(keys: &ApiKeys) {
+        let ids = keys.snapshot().ids();
+        let t = keys.touches.lock().unwrap();
+        assert!(t.last.len() <= KEY_TOUCH_ENTRIES && t.pending.len() <= MAX_PENDING_KEY_TOUCHES);
+        assert!(t.last.keys().chain(&t.pending).all(|id| ids.contains(id)), "a removed key is remembered");
+        assert!(t.pending.iter().all(|id| t.last.contains_key(id)));
+    }
+
+    // AC3/tests: on a fake clock, a key is written once per
+    // KEY_TOUCH_INTERVAL: not at the boundary, and again just past it.
+    #[tokio::test]
+    async fn last_used_writes_keep_the_one_minute_throttle() {
+        let (write, written) = recording();
+        let keys = active(2, write);
+        let set = keys.snapshot();
+        let t0 = Instant::now();
+        assert_eq!(keys.touch_at(1, &set, t0), Touch::Queued);
+        for d in [Duration::ZERO, Duration::from_secs(1), KEY_TOUCH_INTERVAL] {
+            assert_eq!(keys.touch_at(1, &set, t0 + d), Touch::Throttled, "{d:?} after");
+        }
+        assert_eq!(keys.touch_at(2, &set, t0 + KEY_TOUCH_INTERVAL), Touch::Queued, "per key");
+        idle(&keys).await;
+        assert_eq!(keys.touch_at(1, &set, t0 + KEY_TOUCH_INTERVAL + Duration::from_nanos(1)), Touch::Queued);
+        assert_eq!(keys.touch_at(1, &set, t0 + KEY_TOUCH_INTERVAL * 2), Touch::Throttled);
+        idle(&keys).await;
+        let mut ids = written.lock().unwrap().clone();
+        ids.sort();
+        assert_eq!(ids, [1, 1, 2], "key 1 twice, key 2 once");
+        assert_eq!((tstat(&keys, "queued"), tstat(&keys, "written"), tstat(&keys, "writers")), (3, 3, 0));
+    }
+
+    // AC1: a request admitted before a revoke cannot put the key back, and
+    // a revoke drops what was remembered or waiting for it.
+    #[tokio::test]
+    async fn revoked_keys_leave_no_last_used_state() {
+        let (m, keys) = in_memory();
+        let (a, _) = keys.create(&m, "a", "ingest").await.unwrap();
+        let (b, _) = keys.create(&m, "b", "ingest").await.unwrap();
+        let before = keys.snapshot();
+        let now = Instant::now();
+        assert_eq!(keys.touch_at(a.id, &before, now), Touch::Queued);
+        idle(&keys).await;
+        assert_eq!(keys.touches.lock().unwrap().last.len(), 1);
+
+        keys.revoke(&m, a.id).await.unwrap();
+        keys.revoke(&m, b.id).await.unwrap();
+        assert!(keys.touches.lock().unwrap().last.is_empty(), "the revoke dropped a's entry");
+        assert_eq!(tstat(&keys, "forgotten"), 1);
+        // Both were admitted by the set from before the revokes.
+        for id in [a.id, b.id] {
+            assert_eq!(keys.touch_at(id, &before, now + KEY_TOUCH_INTERVAL * 2), Touch::Retired);
+        }
+        assert_eq!((tstat(&keys, "tracked"), tstat(&keys, "retired")), (0, 2));
+        assert!(m.list_api_keys().unwrap().is_empty());
+        assert_bounded(&keys);
+    }
+
+    // AC1: the race itself, made deterministic: a touch that saw the key
+    // active and queued it while the revoke was writing loses its entry
+    // when the revoke publishes, and its write leaves the revoked row alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_touch_racing_a_revoke_is_dropped_when_the_revoke_publishes() {
+        let (m, keys) = in_memory();
+        let (rec, _) = keys.create(&m, "a", "ingest").await.unwrap();
+        let admitted = keys.snapshot();
+        let (gate, started, release) = gated(Ok(()));
+        let revoke = tokio::spawn({
+            let (keys, m) = (keys.clone(), m.clone());
+            async move {
+                let write = move || {
+                    gate()?;
+                    m.revoke_api_key(rec.id)
+                };
+                keys.change(write, move |k, ()| k.remove(rec.id)).await
+            }
+        });
+        started.await.unwrap();
+        // Not published yet, so the key is still active: queued.
+        let now = Instant::now();
+        assert_eq!(keys.touch_at(rec.id, &admitted, now), Touch::Queued);
+        idle(&keys).await;
+        release.send(()).unwrap();
+        revoke.await.unwrap().unwrap();
+        assert_eq!(keys.touch_at(rec.id, &admitted, now + KEY_TOUCH_INTERVAL * 2), Touch::Retired);
+        assert_eq!((tstat(&keys, "tracked"), tstat(&keys, "pending")), (0, 0));
+        assert_bounded(&keys);
+    }
+
+    // AC1/AC4: 10,000 sequential create → use → revoke operations, with at
+    // most 8 keys active, leave state bounded by the active keys, not by
+    // the revoked ones, and last-used is persisted for each key used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ten_thousand_revoked_keys_leave_nothing_behind() {
+        let (m, keys) = in_memory();
+        let mut live = std::collections::VecDeque::new();
+        let mut peak = 0;
+        for i in 0..10_000 {
+            let (rec, key) = keys.create(&m, &format!("k{i}"), "ingest").await.unwrap();
+            let set = keys.snapshot();
+            let (id, _) = set.find(&key).unwrap();
+            assert_eq!(keys.touch(id, &set), Touch::Queued);
+            live.push_back(rec.id);
+            if live.len() > 8 {
+                keys.revoke(&m, live.pop_front().unwrap()).await.unwrap();
+            }
+            peak = peak.max(keys.touches.lock().unwrap().last.len());
+            if i % 1000 == 0 {
+                assert_bounded(&keys);
+            }
+        }
+        idle(&keys).await;
+        assert_bounded(&keys);
+        assert!(peak <= 9, "at most the active keys and one being revoked are remembered (peak {peak})");
+        assert_eq!(tstat(&keys, "tracked"), 8);
+        assert_eq!(tstat(&keys, "forgotten"), 9_992);
+        let listed = m.list_api_keys().unwrap();
+        assert_eq!(listed.len(), 8);
+        assert!(listed.iter().all(|k| k.last_used_at.is_some()), "the active keys' last-used was written");
+        assert!(tstat(&keys, "written") >= 8 && tstat(&keys, "written") <= 10_000);
+        assert!(tstat(&keys, "peakPending") <= MAX_PENDING_KEY_TOUCHES as u64);
+    }
+
+    // AC1/AC4: concurrent touches and revokes: no revoked key is remembered
+    // afterwards, whatever the interleaving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_touches_and_revokes_leave_only_active_keys() {
+        let (m, keys) = in_memory();
+        let mut made = Vec::new();
+        for i in 0..64 {
+            made.push(keys.create(&m, &format!("k{i}"), if i % 2 == 0 { "ingest" } else { "admin" }).await.unwrap());
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let ids: Vec<i64> = made.iter().map(|(rec, _)| rec.id).collect();
+        let touchers: Vec<_> = (0..4)
+            .map(|w| {
+                let (keys, done, ids) = (keys.clone(), done.clone(), ids.clone());
+                tokio::spawn(async move {
+                    // Each pass a minute later, so every touch is due.
+                    let mut now = Instant::now();
+                    while !done.load(Ordering::SeqCst) {
+                        let set = keys.snapshot();
+                        // As requests do: only keys this set admits.
+                        for id in ids.iter().skip(w % 2).filter(|id| set.has_id(**id)) {
+                            keys.touch_at(*id, &set, now);
+                        }
+                        now += KEY_TOUCH_INTERVAL * 2;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+        for id in ids.iter().step_by(2) {
+            keys.revoke(&m, *id).await.unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        for t in touchers {
+            t.await.unwrap();
+        }
+        idle(&keys).await;
+        assert_bounded(&keys);
+        assert!(tstat(&keys, "tracked") <= 32);
+        assert_matches_store(&keys, &m);
+    }
+
+    // AC2: a stalled database: one writer thread, at most
+    // MAX_PENDING_KEY_TOUCHES keys waiting, the rest dropped at once
+    // (requests never wait), nothing else spawned; afterwards the dropped
+    // keys are written on their next use.
+    #[test]
+    fn a_stalled_writer_bounds_waiting_keys_and_threads() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (started_tx, started) = mpsc::channel::<()>();
+            let (release, released) = mpsc::channel::<()>();
+            let released = std::sync::Mutex::new(released);
+            let started_tx = std::sync::Mutex::new(started_tx);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let c = calls.clone();
+            let write: TouchWrite = Arc::new(move |ids: &[i64]| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.lock().unwrap().send(());
+                let _ = released.lock().unwrap().recv();
+                Ok(ids.len())
+            });
+            let n = 5_000;
+            let keys = active(n, write);
+            let set = keys.snapshot();
+            let now = Instant::now();
+            assert_eq!(keys.touch_at(1, &set, now), Touch::Queued);
+            started.recv().unwrap();
+            // The writer is stalled with key 1; everything else waits or is dropped.
+            let decided = Instant::now();
+            let outcomes: Vec<_> = (2..=n).map(|id| keys.touch_at(id, &set, now)).collect();
+            assert!(decided.elapsed() < Duration::from_secs(5), "touches never wait for the writer");
+            let count = |o: Touch| outcomes.iter().filter(|&&x| x == o).count();
+            assert_eq!(count(Touch::Queued), MAX_PENDING_KEY_TOUCHES);
+            assert_eq!(count(Touch::Dropped), n as usize - 1 - MAX_PENDING_KEY_TOUCHES);
+            assert_eq!((tstat(&keys, "pending"), tstat(&keys, "writers")), (MAX_PENDING_KEY_TOUCHES as u64, 1));
+            assert_eq!(tstat(&keys, "tracked"), 1 + MAX_PENDING_KEY_TOUCHES as u64, "dropped keys are not remembered");
+            // A waiting key used again is not queued twice.
+            assert_eq!(keys.touch_at(2, &set, now), Touch::Throttled);
+            // The other blocking thread is free: waiting keys hold none.
+            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ())).await.unwrap().unwrap();
+
+            release.send(()).unwrap();
+            started.recv().unwrap();
+            release.send(()).unwrap();
+            idle(&keys).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "the waiting keys were written in one batch");
+            assert_eq!(tstat(&keys, "written"), 1 + MAX_PENDING_KEY_TOUCHES as u64);
+            // A dropped key is written on its next use.
+            assert_eq!(keys.touch_at(n, &set, now), Touch::Queued);
+            started.recv().unwrap();
+            release.send(()).unwrap();
+            idle(&keys).await;
+            assert_bounded(&keys);
+        });
+    }
+
+    // AC2: with KEY_TOUCH_ENTRIES keys all written recently, further keys
+    // are deferred, not written and not evicting anything, so requests
+    // cannot turn into a write storm; once entries age out they get in.
+    #[tokio::test]
+    async fn high_cardinality_keys_at_the_cap_are_deferred_not_written() {
+        let (write, written) = recording();
+        let extra = 1_000;
+        let keys = active(KEY_TOUCH_ENTRIES as i64 + extra, write);
+        let set = keys.snapshot();
+        let t0 = Instant::now();
+        for chunk in (1..=KEY_TOUCH_ENTRIES as i64).collect::<Vec<_>>().chunks(MAX_PENDING_KEY_TOUCHES) {
+            for &id in chunk {
+                assert_eq!(keys.touch_at(id, &set, t0), Touch::Queued);
+            }
+            idle(&keys).await;
+        }
+        assert_eq!(tstat(&keys, "tracked"), KEY_TOUCH_ENTRIES as u64);
+        assert_eq!(tstat(&keys, "trackedBytes"), tstat(&keys, "trackedByteCapacity"));
+
+        // Every key, round-robin, for most of a minute: only the extra keys
+        // are refused, and nothing more is written.
+        for step in 0..30 {
+            let now = t0 + Duration::from_secs(2 * step);
+            for id in 1..=KEY_TOUCH_ENTRIES as i64 + extra {
+                let want = if id as usize > KEY_TOUCH_ENTRIES { Touch::Deferred } else { Touch::Throttled };
+                assert_eq!(keys.touch_at(id, &set, now), want);
+            }
+        }
+        assert_eq!(written.lock().unwrap().len(), KEY_TOUCH_ENTRIES, "no write storm");
+        assert_eq!(tstat(&keys, "deferred"), 30 * extra as u64);
+
+        // After the interval the old entries are stale: the extra keys get
+        // in (and are written once), within the cap.
+        let later = t0 + KEY_TOUCH_INTERVAL + Duration::from_secs(1);
+        for id in KEY_TOUCH_ENTRIES as i64 + 1..=KEY_TOUCH_ENTRIES as i64 + extra {
+            assert_eq!(keys.touch_at(id, &set, later), Touch::Queued);
+        }
+        idle(&keys).await;
+        assert_eq!(written.lock().unwrap().len(), KEY_TOUCH_ENTRIES + extra as usize);
+        assert_eq!(tstat(&keys, "tracked"), extra as u64, "the stale entries were swept");
+        assert_bounded(&keys);
+    }
+
+    // AC3: a failed write releases the writer and keeps the throttle (no
+    // retry storm against a failing database); a panicking writer gives
+    // back the waiting keys, which are queued again on next use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_and_panicking_writes_release_everything() {
+        let failing: TouchWrite = Arc::new(|_: &[i64]| Err(MetadataError::Invalid("disk I/O error".into())));
+        let keys = active(2, failing);
+        let set = keys.snapshot();
+        let now = Instant::now();
+        assert_eq!(keys.touch_at(1, &set, now), Touch::Queued);
+        idle(&keys).await;
+        assert_eq!((tstat(&keys, "failedBatches"), tstat(&keys, "writers"), tstat(&keys, "written")), (1, 0, 0));
+        assert_eq!(keys.touch_at(1, &set, now + Duration::from_secs(1)), Touch::Throttled, "not retried at once");
+        assert_eq!(keys.touch_at(1, &set, now + KEY_TOUCH_INTERVAL * 2), Touch::Queued, "retried after the interval");
+        idle(&keys).await;
+        assert_eq!(tstat(&keys, "failedBatches"), 2);
+
+        // The writer panics on its first batch while key 2 waits.
+        let (gate, started, release) = gated::<usize>(Ok(0));
+        let gate = std::sync::Mutex::new(Some(gate));
+        let panics: TouchWrite = Arc::new(move |_: &[i64]| {
+            if let Some(g) = gate.lock().unwrap().take() {
+                let _ = g();
+            }
+            panic!("injected last-used write panic")
+        });
+        let keys = active(2, panics);
+        let set = keys.snapshot();
+        assert_eq!(keys.touch_at(1, &set, now), Touch::Queued);
+        started.await.unwrap();
+        assert_eq!(keys.touch_at(2, &set, now), Touch::Queued);
+        release.send(()).unwrap();
+        idle(&keys).await;
+        assert_eq!((tstat(&keys, "abandoned"), tstat(&keys, "writers"), tstat(&keys, "pending")), (1, 0, 0));
+        assert_eq!(keys.touch_at(2, &set, now), Touch::Queued, "an abandoned key is queued again on its next use");
+        idle(&keys).await;
+        assert_bounded(&keys);
+    }
+
+    // AC3: at shutdown a writer that never runs gives back its slot and the
+    // waiting keys.
+    #[test]
+    fn a_writer_that_never_runs_releases_everything() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let handle = rt.handle().clone();
+        rt.shutdown_background();
+        let keys = active(1, Arc::new(|ids: &[i64]| Ok(ids.len())));
+        let set = keys.snapshot();
+        let _enter = handle.enter();
+        assert_eq!(keys.touch_at(1, &set, Instant::now()), Touch::Queued);
+        let t = keys.touches.lock().unwrap();
+        assert!(!t.writing && t.pending.is_empty() && t.last.is_empty());
+        drop(t);
+        assert_eq!(tstat(&keys, "abandoned"), 1);
+    }
+
+    // AC4: across a restart the stored last-used survives and the
+    // bookkeeping starts empty: each key is written once more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn last_used_survives_a_restart_and_bookkeeping_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.db");
+        let m = Arc::new(Metadata::open(&path).unwrap());
+        let keys = Arc::new(ApiKeys::load(&m).unwrap());
+        let (_, key) = keys.create(&m, "ci", "ingest").await.unwrap();
+        let set = keys.snapshot();
+        let (id, _) = set.find(&key).unwrap();
+        assert_eq!(keys.touch(id, &set), Touch::Queued);
+        idle(&keys).await;
+        let first = m.list_api_keys().unwrap()[0].last_used_at.unwrap();
+        drop((keys, set, m));
+
+        let m = Arc::new(Metadata::open(&path).unwrap());
+        assert_eq!(m.list_api_keys().unwrap()[0].last_used_at, Some(first));
+        let keys = Arc::new(ApiKeys::load(&m).unwrap());
+        assert_eq!(tstat(&keys, "tracked"), 0);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let set = keys.snapshot();
+        assert_eq!(keys.touch(id, &set), Touch::Queued);
+        assert_eq!(keys.touch(id, &set), Touch::Throttled);
+        idle(&keys).await;
+        assert!(m.list_api_keys().unwrap()[0].last_used_at.unwrap() > first);
     }
 }
